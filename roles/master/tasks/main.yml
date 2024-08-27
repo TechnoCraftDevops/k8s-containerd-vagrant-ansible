@@ -1,0 +1,112 @@
+- name: check services
+  command: echo 'check services'
+  notify:
+      - Restart Containerd
+      - Restart Docker
+
+- name: Create an Empty file for Kubeadm configuring
+  copy:
+    content: ""
+    dest: /etc/kubernetes/kubeadm-config.yaml
+    force: no
+
+- name: Configure container runtime for K8S
+  blockinfile:
+    path: /etc/kubernetes/kubeadm-config.yaml
+    block: |
+      apiVersion: kubeadm.k8s.io/v1beta3
+      bootstrapTokens:
+      - groups:
+        - system:bootstrappers:kubeadm:default-node-token
+        token: abcdef.0123456789abcdef
+        ttl: 24h0m0s
+        usages:
+        - signing
+        - authentication
+      kind: InitConfiguration
+      localAPIEndpoint:
+        advertiseAddress: {{ master_node_ip }}
+        bindPort: 6443
+      nodeRegistration:
+        criSocket: unix:///var/run/containerd/containerd.sock
+        imagePullPolicy: IfNotPresent
+        name: {{ master_node_name }}
+        taints: null
+      ---
+      apiServer:
+        timeoutForControlPlane: 4m0s
+      apiVersion: kubeadm.k8s.io/v1beta3
+      certificatesDir: /etc/kubernetes/pki
+      clusterName: kubernetes
+      controllerManager: {}
+      dns: {}
+      etcd:
+        local:
+          dataDir: /var/lib/etcd
+      imageRepository: registry.k8s.io
+      kind: ClusterConfiguration
+      kubernetesVersion: 1.29.0
+      networking:
+        dnsDomain: cluster.local
+        podSubnet: {{ pod_subnet }}
+        #serviceSubnet: service_subnet
+      scheduler: {}
+
+- name: config & init kubeadm
+  block:
+  - name: Initialize the cluster
+    shell: kubeadm init --config /etc/kubernetes/kubeadm-config.yaml >> cluster_initialized.log
+    args:
+      chdir: /home/vagrant
+      creates: cluster_initialized.log
+
+  - name: Create .kube directory for vagrant user
+    become: yes
+    become_user: vagrant
+    file:
+      path: $HOME/.kube
+      state: directory
+      mode: 0755
+
+  - name: Copy admin.conf to vagrant's kube config
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /home/vagrant/.kube/config
+      remote_src: yes
+      owner: vagrant
+
+  - name: Write flannel config
+    file:
+      path: /run/flannel
+      state: directory
+      mode: 0755
+
+  # Error: network plugin cni failed — network: open /run/flannel/subnet.env: no such file or directory issue.
+  - name: Write flannel config
+    blockinfile:
+      dest: /run/flannel/subnet.env
+      state: present
+      create: yes
+      block: |
+        FLANNEL_NETWORK={{ flannel_network }}
+        FLANNEL_SUBNET={{ flannel_subnet }}
+        FLANNEL_MTU={{ flannel_mtu }}
+        FLANNEL_IPMASQ={{flannel_ipmasq}}
+
+  - name: Install Pod Network with Flannel
+    become: yes
+    become_user: vagrant
+    shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml >> pod_network_setup.log
+    args:
+      chdir: $HOME
+      creates: pod_network_setup.log
+
+- name: Run join-command
+  block:
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+
+  - name: Copy join command to local file
+    become: false
+    local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join-command"

@@ -1,0 +1,164 @@
+# set hostname to
+- name: Set master and workers hosts
+  blockinfile:
+    path: /etc/hosts
+    state: present
+    create: yes
+    block: |
+      {{ node_ip }}   {{ node_name }}
+
+# install necessary package
+- name: Install packages that allow apt to be used over HTTPS
+  apt:
+    name='{{ item.name }}'
+    state=present
+    update_cache=yes
+  with_items: "{{ apt_packages | default([]) }}"
+
+# install & config Docker & Containerd
+- name: Complete install of Docker & Containerd
+  block:
+  - name: add Docker apt-key
+    get_url:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      dest: /etc/apt/keyrings/docker-apt-keyring.asc
+      mode: '0644'
+      force: true
+
+  - name: add Docker's APT repository
+    apt_repository:
+      repo: "deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker-apt-keyring.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+      state: present
+      update_cache: yes
+
+  - name: Install docker
+    apt:
+      name="{{ item.name }}"
+      state=present
+      update_cache=yes
+    with_items: "{{ docker_packages | default([]) }}"
+    notify:
+      - Restart Docker
+
+  - name: Install containerd
+    apt:
+      name: containerd.io
+      state: present
+
+  - name: Add vagrant user to docker group
+    user:
+      name: vagrant
+      group: docker
+
+  - name: configure containerd
+    shell: |
+      containerd config default > /etc/containerd/config.toml
+    args:
+      executable: /bin/sh
+
+  - name: enable SystemdCgroup for containerd
+    replace:
+      path: /etc/containerd/config.toml
+      regexp: "            SystemdCgroup = false"
+      replace: "            SystemdCgroup = true"
+
+  - name: add Containerd conf file
+    blockinfile:
+      path: /etc/modules-load.d/containerd.conf
+      state: present
+      create: yes
+      block: |
+        overlay
+        br_netfilter
+
+  - name: Add overlay module
+    modprobe:
+      name: overlay
+      state: present
+
+  - name: Add br_netfilter module
+    modprobe:
+      name: br_netfilter
+      state: present
+
+  - name: Reload sysctl settings
+    command: sysctl --system
+  notify:
+      - Restart Docker
+      - Restart Containerd
+
+# install & config K8s
+- name: Install K8S components
+  block:
+  - name: add K8S conf file
+    blockinfile:
+      path: /etc/sysctl.d/99-kubernetes-cri.conf
+      state: present
+      create: yes
+      block: |
+        net.bridge.bridge-nf-call-iptables  = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.ipv4.ip_forward                 = 1
+
+  - name: add Kubernetes apt-key
+    get_url:
+      url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+      dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+      mode: '0644'
+      force: true
+
+  - name: add Kubernetes' APT repository
+    apt_repository:
+      repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+      state: present
+      update_cache: yes
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Install Kubelet
+    apt:
+      name: kubelet=1.29.*
+      state: present
+      update_cache: true
+
+  - name: Install Kubeadm
+    apt:
+      name: kubeadm=1.29.*
+      state: present
+
+  - name: Enable kubelet
+    service:
+      name: kubelet
+      state: started
+      enabled: yes
+
+  - name: Set bridge-nf-call-iptables
+    sysctl:
+      name: net.bridge.bridge-nf-call-iptables
+      value: 1
+
+  - name: Set ip_forward
+    sysctl:
+      name: net.ipv4.ip_forward
+      value: 1
+
+  - name: Reboot
+    reboot:
+
+  - name: Install Kubectl
+    become: yes
+    apt:
+      name: kubectl=1.29.*
+      state: present
+      force: yes
